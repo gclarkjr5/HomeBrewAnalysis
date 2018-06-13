@@ -1,0 +1,462 @@
+---
+title: "HomeBrew_BeerAnalysis"
+author: "Gary L Clark Jr."
+date: "April 11, 2018"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Problem Statement
+The data that has been provided contains submissions of beer recipes from Brewer's Friend. Some of the information contained are: Beer Name, Beer Style, Original Gravity, Brew Method, etc.
+
+Based off of what has been provided, I would be interested to see if one can predict the "Style of Beer".
+
+# Intitial Setup
+
+## Clear Environment
+```{r clear_env, warning=FALSE, message=FALSE}
+rm(list = ls())
+```
+
+## Load Libraries
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+library(ggplot2) # data viz
+library(magrittr) # pipe operators
+library(corrplot) # visualize correlation matrices
+library(purrr) # mapping over arrays
+library(caret) # 1 stop shop for ML libraries, ML functionalities, and ML controls
+library(rpart) # Decision Tree
+library(rpart.plot) # Visualize Decision Trees
+library(e1071) # SVM and Naive-Bayes
+library(class) # K-Nearest-Neighbors
+library(randomForest) # Random Fores
+library(broom) # Performing ML on grouped data sets
+```
+
+## Read in Data
+```{r read_data, warning=FALSE, message=FALSE}
+setwd("E:\\Gee\\Kaggle Data\\beer-recipes") # Locate File
+
+dataFiles = grep(".csv", list.files(), value = T)
+# Output are 2 files from the original .zip, recipeData.csv & styleData.csv
+
+recipe = read.csv(dataFiles[1]) # grap recipe Data
+```
+# Intitial View
+
+Let's view the data in a few different ways to get a good overall understanding of what it is we are working with.
+When I first started getting into data, I would often skip this part, but now it has become a mandatory step for me as it has literally saved me HOURS worth of downstream troubleshooting by recognizing anomalies and irregularities up front.
+You have probably heard many times before that Data Cleaning is ~75% of the process, I would add that it is probably also the most revisited part of the process too.
+```{r str_sum}
+head(recipe)
+str(recipe)
+glimpse(recipe)
+summary(recipe)
+```
+
+# Data Cleaning/Pre-Processing
+## Fixing Data
+
+The very first thing that jumped out to me in viewing the data above, is that there are a bunch of NAs in the data. But if you pay close attention, they aren't recognized as ACTUAL 'NA' values, instead, they are recognized as class "character" (likely due to the '/' between the 'N' and the 'A'). This is the first fix.
+ 
+```{r fixing_data}
+ # Change the values to actual NAs that R can understand as missing data
+missingValueFill = function(x) {
+  if(length(which(x == "N/A")) > 0) { # check to see if the column has any "N/A" in it
+    ifelse(x == "N/A", NA, as.character(x)) # coerce to NA
+    # The False condition in the ifelse above needs to be converted to a character
+    # If 'x' was returned alone, then all factors would change to their integer representation (data type along with it)
+  } else {
+    x
+  }
+}
+
+recipeNA = recipe %>%
+  mutate_all(funs(missingValueFill))
+
+
+recipeNA %>%
+  sapply(., function(x) {
+    sum(is.na(x))
+  })
+```
+
+## Change Data Types
+
+Now that NAs are appearing correctly, we can fix the data types for the columns.
+
+```{r changing_class}
+# Clean up classes
+recipeClass = recipeNA %>%
+  mutate_at(vars(BoilGravity, MashThickness, PrimaryTemp, PitchRate), as.numeric) %>% # Coerce to numerical data
+  mutate_at(vars(Style, PrimingMethod), as.factor) %>% # coerce to categorical data
+  mutate_at(vars(URL), as.character) # coerce to character
+```
+
+## Removing Unnecessary Data
+
+Let's take a naive glance at the data and see if there are any columns that won't aid in achieving our goal of predicting Beer Style. Focusing on columns 1, 2, 3 & 5, I would assume that these don't appear to add much value. The reason being is that they all appear to be unique to the submission or redundant info. Name and URL refer to the name of the specific Beer submission (whatever the founder wanted to name it) and where on the web that submission came from. BeerID and StyleID are redundant bits of data as they are just the numerical references (indecies) of the Beer Name and Style, respectively. We've already determined that we will remove the Beer Name, and since we have the Style, StyleID becomes redundant so it can also be removed.
+
+```{r removeCols, warning=FALSE}
+recipeRemoveCols = recipeClass %>%
+  select(-c(which(colnames(.) %in% c("BeerID", "StyleID", "Name", "URL"))))
+```
+
+## Handling Missing Data
+### View NAs
+
+In an earlier call when I was converting string NAs into actual NAs, you can see that I validated it by seeing how many actual NAs were appearing in each column. Let's see what those proportions look like.
+
+```{r naProportions}
+missingValueProp = function(x) {
+  mean(is.na(x)) * 100
+}
+
+# Show only columns with NA values
+proportionofNA = recipeRemoveCols %>%
+  summarise_all(missingValueProp) %>%
+  gather("columns", "percentNA") %>% # Gather columns into key-value pairs so I can work on them
+  filter(percentNA > 0) # Return columns with missing values
+
+proportionofNA %>%
+  mutate(naCols = if_else(percentNA > 30, "gray", "lightblue")) %>% # identify what makes the cut-off
+  ggplot(aes(x = reorder(columns, -percentNA), y = percentNA, fill = I(naCols))) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = 30, color = "red", linetype = 2) +
+  ggtitle("Percent of missing records for given variable\nRemove columns with 30% (red line) or more NAs") +
+  ylab("%") +
+  xlab("Variables") +
+  theme(axis.text.x = element_text(angle = -25))
+```
+
+I thought it would be reasonable to put a threshold at 30%. Any column with NAs beyond this threshold will get dropped.
+
+** I think this would be an interesting place to adjust the threshold. If I moved it up to 50%, 2 more columns would get added. For now however, I'll keep it at 30% **
+
+## What to do with NAs
+As mentioned above, any columns with missing values above 30% should get dropped.
+
+```{r missingDataCutOff}
+manyNAcols = proportionofNA$columns[which(proportionofNA$percentNA > 30)]
+
+recipeRemoveCols %<>%
+  select(-c(which(colnames(.) %in% manyNAcols)))
+```
+
+This still leaves the columns "Style" and "BoilGravity".
+Since style is what I am trying to predict, I'm going to make another category for the missing values, "Other".
+
+I'll need to change the column back to character class, change the NAs to "Other", then convert back to class factor.
+
+```{r naStyleToOther}
+recipeRemoveCols$Style = as.character(recipeRemoveCols$Style)
+recipeRemoveCols$Style[which(is.na(recipeRemoveCols$Style))] = "Other"
+recipeRemoveCols$Style = as.factor(recipeRemoveCols$Style)
+```
+
+Now on to Boil Gravity. Boil Gravity could potentially be a good feature in predicting Beer Style, so I'm not going to remove it. Why does it contain missing values? Well, while "OG" and "FG" (Original Gravity and Final Gravity, respectively) are measures of specific gravity before and at the completion of fermentation, Boil Gravity I believe is an intermediate check. Maybe stage of measurement is optional in the process since the before and after measures exist. With that said, let's impute what these missing values could be. There are many different approaches to imputing, but I'm going to use a sample statistic imputation.
+
+### Imputing w/ a sample statistic
+This is one of the easier ways I have learned to impute. Essentially, it requires filling in the missing value with the statistic that best represents the central tendency of the data, i.e mean, median, or mode. Let's visualize BoilGravity and then plot all 3 statistics to see what yields a better value.
+
+```{r boilGravityImpute, message=FALSE, warning=FALSE}
+recipeRemoveCols %>%
+  ggplot(aes(BoilGravity)) +
+  geom_histogram()
+
+recipeRemoveCols %>%
+  ggplot(aes(x = 1, y = BoilGravity)) +
+  geom_boxplot() +
+  xlab("")
+```
+
+Wow. So it looks like a huge chunk of values are crowding around 1, with there being quite the large number for outliers. Why is that? If we go back to when we initially viewed the data, we can see that all the "Gravity" columns show many values that look like 1.xxx. However, the histogram above is showing us we have some data up to the 50s. After some wikipedia-ing, I see that the "SugarScale" column was screaming at me all along. Brewers can define the specific gravity of the beer as mentioned before, but some like to use what is known as the "Plato" scale. Since we are here, lets take this opportunity to convert ALL Plato values (OG and FG too) to Specifc Gravity. SG = (4P/1000) + 1
+
+```{r platoToSG, message=FALSE, warning=FALSE}
+platoToSG = function(x) {
+  (4*x/1000) + 1
+}
+
+recipeSugarScaleNest = recipeRemoveCols %>%
+  nest(-SugarScale)
+
+recipeSugarScaleNest$data[[2]] = recipeSugarScaleNest$data[[2]] %>%
+  mutate_at(vars(OG, FG, BoilGravity), platoToSG)
+  
+
+recipeSG = recipeSugarScaleNest %>%
+  unnest(data) %>%
+  mutate(SugarScale = as.factor("Specific_Gravity"))
+
+# Lets look at the shape and distribution of Boil Gravity again now
+
+recipeSG %>%
+  ggplot(aes(BoilGravity)) +
+  geom_histogram()
+
+recipeSG %>%
+  ggplot(aes(x = 1, y = BoilGravity)) +
+  geom_boxplot() +
+  xlab("")
+```
+
+Great! Now this is a much better view of the distribution of Boil Gravity. We can describe this distribution as Unimodal (1-hump) and Right Skewed (heavy tail to the right). We can verify there are a significant amount of outliers from the boxplot that are above the average. (Maybe some of the extreme ones are). Due to the heavy right skew from outliers, I would suggest that median be used as the best measure of central tendency for Boil Gravity, since it is affected by outliers to a lesser degree.
+
+```{r imputeBoilGravity}
+recipeSG$BoilGravity[which(is.na(recipeSG$BoilGravity))] = median(recipeSG$BoilGravity, na.rm = T)
+
+summary(recipeSG)
+```
+
+# Data Exploration
+## Exploratory Analysis
+
+As mentioned in the Problem Statement, the goal is to predict the style of beer. With over +100 different beer styles, I figured it would be easier to grab a subset of this data. So I went with the TOP 10 beer styles!
+```{r topten, warning=FALSE}
+# Return the top ten beer styles based off number of submissions
+popularBeer = recipeSG %>%
+  group_by(Style) %>%
+  summarise(num = n(),
+            perc = round(100*(num/nrow(recipe)), digits = 2)) %>%
+  top_n(10, perc)
+
+popularBeer %>%
+  ggplot(aes(x = reorder(Style, perc), y = perc)) +
+  geom_bar(stat = "identity") +
+  ggtitle("Top 10 HomeBrew Beer Submissions") +
+  xlab("Beer Styles") +
+  ylab("% of all submissions") +
+  coord_flip()
+```
+
+Now that I have the top 10 beers, I can go back to the original, clean data set, and filter it down for only the top 10 beers.
+```{r filter_original}
+recipeTopTen = recipeSG %>%
+  filter(Style %in% popularBeer$Style) %>%
+  droplevels()
+```
+
+### Categorical Variables
+
+Let's take a look at the proportions of Brew Methods and Sugar Scales, our 2 categorical features.
+```{r categorical, message=FALSE}
+recipeTopTen %>%
+  select(which(sapply(., class) == "factor"), -2) %>%
+  gather("cols", "sets") %>%
+  ggplot(aes(x = cols, fill = sets)) +
+  geom_bar(position = "fill") +
+  ggtitle("Proportions of categorical variables") +
+  xlab("") +
+  ylab("proportion") +
+  guides(fill=guide_legend(title=""))
+```
+
+While I was imputing the missing values for BoilGravity, we came across how the column "SugarScale" was just information on if the values in OG, FG, and BoilGravity were recorded as Specific Gravity or Plato units. Now that everything has been converted to Specific Gravity, there is no variation in this column anymore, and can thus be removed.
+
+```{r remove_SugarScale}
+recipeTopTen %<>% select(-which(colnames(.) == "SugarScale"))
+```
+
+Moving onto "BrewMethod", its also quite clear that "All Grain" is the majority (~70%). However, this leaves about 30% of the data that is almost evenly split between the rest of the categories of the Brew Method feature. I don't think it would hurt to leave this feature in the data set.
+
+** A Quick Note: I thought about this when I was driving to soccer practice the other day, but it might be pretty interesting to see if the data can be grouped by "BrewMethod" and then using the data nested within each Brew Method come up with a model that can predict the style. I'm not the most knowledgeable person about beer, nor have I ever brewed any myself, but the Brew Method in my eyes seems like more of a process variable rather than a qualitative attribute of the beer style. For all beer experts out there, please shout at me if I am way off, or even if I may be partially right. Feedback is always appreciated and encouraged :-) **
+
+
+### Numerical Variables
+
+First, let's pull out all of the numerical features and run a correlation matrix over them.
+```{r numerical}
+# Explore numeric features
+numericFeats = recipeTopTen %>%
+  select(which(sapply(., class) != "factor"))
+
+corrplot(cor(numericFeats, use = "complete.obs"), method = "number")
+```
+
+One can quickly see that there seems to be a near perfect correlation between "Size.L." and "BoilSize", which appears to be redundant information, so I will go ahead and drop the "Size.L." feature. Additionally, there seems to be a strong correlation between "OG" and "ABV" and a semi-strong one between "OG" and "FG". This may be an issue with collinearity or potential multi-collinearity, So let's investigate...
+
+I am aware of 2 different measures to check for this. Tolerance & Variance Inflation Factor (VIF).
+
+1. Tolerance is the amount of variation in an independent variable that is not explained by the variance in the other independent variables. So while R2 is the measure of variation that IS explained by the predictors, tolerance would simply be "1 - R2". Values less than 0.10 tend to be indicative of problematic variables.
+
+2. Variance Inflation Factor is the reciprocal of tolerance, 1 / Tolerance. This represents the degree of inflation in standard errors as a result of collinearity/multicollinearity. Values > 10 prove to be problematic. 
+
+```{r collinearity}
+OG_FG_ABV = numericFeats %>%
+  select(which(colnames(.) %in% c("OG", "FG", "ABV"))) %>% # select IVs to test for multicollinearity
+  lm(OG ~ ., data = .) %>% # regress one independent variable on the other ones
+  glance() %>% # pull out the model performance metrics into a dataframe
+  transmute(Tolerance = 1 - r.squared, VIF = 1/Tolerance, Response = "OG_FG_ABV")
+
+OG_FG = numericFeats %>%
+  select(which(colnames(.) %in% c("OG", "FG"))) %>% 
+  lm(OG ~ ., data = .) %>% 
+  glance() %>% 
+  transmute(Tolerance = 1 - r.squared, VIF = 1/Tolerance, Response = "OG_FG")
+
+OG_ABV = numericFeats %>%
+  select(which(colnames(.) %in% c("OG", "ABV"))) %>% 
+  lm(OG ~ ., data = .) %>% 
+  glance() %>% 
+  transmute(Tolerance = 1 - r.squared, VIF = 1/Tolerance, Response = "OG_ABV")
+
+bind_rows(OG_FG_ABV, OG_FG, OG_ABV)
+```
+
+OG definitely appears to be running into an issue of multicollinearity with "FG" and "ABV", however, breaking those up into separate variables, we can see that its really just "OG" vs "ABV" that is the problem. Since we already have some measures of Gravity, I'll leave "ABV" in the dataset and drop Original Gravity "OG".
+
+```{r dropOG}
+recipeFeatures = recipeTopTen %>%
+  select(-c(which(colnames(.) %in% c("OG", "Size.L."))))
+
+corrplot(cor(recipeFeatures[,-c(1,10)]), method = "number")
+```
+
+Now that I've accounted for NAs, lack of variation, and collinearity, its time to begin looking at the shape and dispersion of the data. 
+
+Let's turn the data into key-value pairs, then visualize.
+```{r visualize}
+recipeTidy = recipeFeatures %>%
+  select(which(sapply(., class) != "factor")) %>%
+  # mutate_all(funs(log)) %>% # normalize the skew shown in the density plots
+  gather("features", "values")
+
+recipeTidy %>%
+  ggplot(aes(values)) +
+  geom_density() +
+  facet_wrap(~features, scales = "free") +
+  xlab("numerical features")
+
+recipeTidy %>%
+  ggplot(aes(x = 1, y = values)) +
+  geom_boxplot() +
+  facet_wrap(~features, scales = "free") +
+  xlab("numerical features")
+
+recipeFeatures %>%
+  select(which(sapply(., class) != "factor")) %>%
+  gather("features", "values") %>%
+  group_by(features) %>%
+  summarise_all(funs(mean, median, sd, IQR), na.rm = T)
+```
+
+Having a look at the amount of skew in the density plots and the large number of outliers in the boxplots, I would suggest that the median be used as a more accurate measure of central tendency and the IQR (Inner Quartile Range) as a better representation of the dispersion of the data.
+
+### Homogeneity
+To get an idea of how the data can be purely split, we will use a decision tree to visualize the splits in data, and a random forest to validate the importance of the chosen features.
+
+```{r decisionTree}
+dtFit = rpart(Style ~ ., method = "class", data = recipeFeatures)
+rpart.plot.version1(dtFit)
+```
+
+According to the decision tree, IBU, Color, and ABV seem to be the variables that help split the data up into its most homogenous forms, and in that particular order. Let's check the variable importance using the ensemble of the decision tree, randomforest.
+
+```{r randomforest}
+rfFit = randomForest(Style ~ ., data = recipeFeatures, importance = T)
+varImpPlot(rfFit)
+```
+
+The randomforest further validates the splits made by the decision tree.
+
+Finally, time to move on to modelling.
+
+# Machine Learning
+## Train & Test Data Split
+
+I'll do a 70-30 split. (70% train, 30% test)
+
+```{r trainTestSplit}
+set.seed(0415)
+trainIndecies = sample(seq_len(nrow(recipeFeatures)), size = round(nrow(recipeFeatures)*0.75, digits = 0))
+
+train = recipeFeatures[trainIndecies,]
+test = recipeFeatures[-trainIndecies, ]
+```
+
+## Train, Test, and Accuracy
+
+The models that I'll try out are:
+1. Decision Tree
+  - Splits data into its most homogenous groups
+  - Default is the greedy approach (chooses largest information gain at each step rather than choosing best option from a global perspective)
+2. Random Forest
+  - The ensembling method of Decision Trees
+  - A collection of randomly sampled subset of features that compose multiple decision trees where all results are aggregated into one
+3. Naive Bayes
+  - Assumes independence among predictors (naivety)
+  - No variance to minimize
+4. Support Vector Machine
+  - Creates linear hyperplanes that best separate the data into classes by maximizing the margins between the plane and the closest points of the data sets
+<!-- 5. XGBoost -->
+
+### Train
+```{r trainModels}
+decisionTreeFit = rpart(Style ~ ., data = train, method = "class")
+randomForestFit = randomForest(Style ~ ., data = train) # !! for large datasets do not use the forumula interface
+naiveBayesFit = naiveBayes(Style ~ ., data = train)
+supportVectorMachineFit = svm(Style ~ ., data = train)
+
+```
+### Test
+```{r testModels}
+test$dtPred = predict(decisionTreeFit, test, type = "class")
+test$rfPred = predict(randomForestFit, test, type = "class")
+test$nbPred = predict(naiveBayesFit, test, type = "class")
+test$svmPred = predict(supportVectorMachineFit, test, type = "class")
+
+```
+### Accuracy
+```{r modelAccuracy}
+dtTable = table(test$Style, test$dtPred)
+rfTable = table(test$Style, test$rfPred)
+nbTable = table(test$Style, test$nbPred)
+svmTable = table(test$Style, test$svmPred)
+
+accuracy = function(x) {
+  sum(diag(x))/sum(x)
+}
+
+sapply(list(decisiontree = dtTable, randomforest = rfTable, naivebayes = nbTable, svm = svmTable), accuracy)
+```
+
+Random Forest wins!
+
+# Nested Modelling
+
+Going back to an earlier hunch, I thought it would be interesting to see if the model performance would improve after grouping the data by "BrewMethod". I'll use the tidy and purrr packages to accomplish this.
+```{r nestData}
+recipeNest = recipeFeatures %>%
+  nest(-BrewMethod) # Nests the data associated with the group (tidy package)
+```
+
+```{r mapNest}
+recipeLM = recipeNest %>%
+  mutate(model = map(data, ~ randomForest(Style ~ ., data = ., method = "class"))) %>% # create a random forest model trained on each set of data specific to the BrewMethod group
+  mutate(results = map(model, ~ predict(., test, type = "class"))) %>% # use each random forest model and test it
+  mutate(scores = map(results, function(x) { # get the true positive rate
+    confMat = table(x, test$Style)
+    data.frame(accuracy = 100*sum(diag(confMat))/sum(confMat))
+  })) %>%
+  mutate(amountData = map(data, nrow)) %>%
+  select(BrewMethod, scores, amountData) %>%
+  unnest()
+
+recipeLM # show the grouped accuracies 
+
+recipeLM %>%
+  summarise(avgAccuracry = mean(accuracy)) # calculate the average accuracy between the models
+
+```
+
+Interesting that 3 of the 4 models performed relatively the same as the ungrouped model. The "All Grain" method however significantly outperformed all models with an 87% accuracy! Maybe that's due to the amount of training data that it was given? Or maybe all other Brew Methods have more variation in their recipes/submissions.
+
+If you followed along, thanks! Any recommendations or suggestions or places where I made a mistake please let me know, it would be much appreciated! I learned A LOT about beer during this journey. I think I'll treat myself to a few tonight :-).
